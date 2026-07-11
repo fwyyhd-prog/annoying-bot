@@ -1,53 +1,39 @@
 import os
-import logging
+import asyncio
 import random
-from typing import Dict, Any
+import logging
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
-    Job,
+    MessageHandler,
+    filters,
 )
 
-# ---------------- إعدادات عامة ---------------- #
+# ============ الإعدادات ============
 
-# تفعيل اللوق للمساعدة في تتبع أي مشكلة
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
 
-# التوكن من متغير البيئة (مهم لـ Railway أو أي استضافة سحابية)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is not set")
-
-# ضع هنا أرقام الـ user_id المسموح لهم بالتحكم في البوت
+# حط أرقام حسابك وحساب الشخص الثاني فقط
 ALLOWED_USERS = {
-    824219206,  # استبدلها بـ user_id حقك
-    735911806,  # واستبدلها بـ user_id حق الشخص الثاني
+    824219206,
+    735911806,
 }
 
-# سرعات الإرسال بالثواني
+# لا تجعل "سريع" أقل من ثانيتين حتى لا يسبب مشاكل إرسال
 SPEEDS = {
-    "speed_fast": 2,    # سريع
-    "speed_medium": 5,  # متوسط
-    "speed_slow": 10,   # بطيء
+    "🚀 سريع": 2,
+    "⏱️ متوسط": 5,
+    "🐢 بطيء": 10,
 }
 
-# حالة القروبات: نخزن الوظيفة (Job) الحالية لكل قروب إن وجدت
-chat_jobs: Dict[int, Job] = {}
-
-# قائمة الرسائل العشوائية - عدّلها كما تحب
 MESSAGES = [
     "رسالة عشوائية 1",
     "رسالة عشوائية 2",
@@ -55,168 +41,143 @@ MESSAGES = [
     "رسالة عشوائية 4",
 ]
 
+# نخزن Task واحد لكل قروب
+running_tasks = {}
 
-# ---------------- دوال مساعدة ---------------- #
-
-def is_allowed_user(user_id: int) -> bool:
-    """يتأكد أن المستخدم من ضمن الحسابين المصرح لهم."""
-    return user_id in ALLOWED_USERS
-
-
-def cancel_chat_job(chat_id: int) -> None:
-    """يلغي أي Job مرتبط بهذا القروب إن وجد."""
-    job = chat_jobs.get(chat_id)
-    if job:
-        job.schedule_removal()
-        chat_jobs.pop(chat_id, None)
+MENU = ReplyKeyboardMarkup(
+    [
+        ["🚀 سريع", "⏱️ متوسط", "🐢 بطيء"],
+        ["⛔ إيقاف", "ℹ️ الحالة"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
-# ---------------- أوامر البوت ---------------- #
+# ============ دوال مساعدة ============
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """أمر /start للترحيب وتوضيح الأوامر."""
-    await update.message.reply_text(
-        "بوت مزعج جاهز.\n"
-        "الأوامر المتاحة:\n"
-        "/speed لاختيار سرعة الإرسال\n"
-        "/stop لإيقاف الإرسال"
-    )
-
-
-async def speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """أمر /speed لعرض خيارات السرعة."""
+def allowed(update: Update) -> bool:
+    """يتأكد أن المتحكم هو أحد الحسابين المسموحين."""
     user = update.effective_user
-    if not user or not is_allowed_user(user.id):
-        return  # تجاهل أي مستخدم غير مسموح
-
-    keyboard = [
-        [
-            InlineKeyboardButton("🚀 سريع", callback_data="speed_fast"),
-            InlineKeyboardButton("⏱ متوسط", callback_data="speed_medium"),
-            InlineKeyboardButton("🐢 بطيء", callback_data="speed_slow"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "اختر سرعة الإرسال التي تريد أن يبدأ بها البوت:",
-        reply_markup=reply_markup,
-    )
+    return bool(user and user.id in ALLOWED_USERS)
 
 
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """أمر /stop لإيقاف الإرسال في هذا القروب."""
-    user = update.effective_user
-    chat = update.effective_chat
+def stop_sender(chat_id: int) -> bool:
+    """يلغي الإرسال الحالي للقروب ويعيد True لو كان شغال."""
+    task = running_tasks.pop(chat_id, None)
 
-    if not user or not is_allowed_user(user.id):
+    if task and not task.done():
+        task.cancel()
+        return True
+
+    return False
+
+
+async def send_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE, seconds: int):
+    """إرسال متكرر إلى أن يتم الإيقاف."""
+    try:
+        while True:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=random.choice(MESSAGES),
+            )
+            await asyncio.sleep(seconds)
+
+    except asyncio.CancelledError:
+        # يحدث بشكل طبيعي عند ضغط زر إيقاف أو تغيير سرعة
+        raise
+
+    except Exception as error:
+        logging.exception("خطأ أثناء الإرسال للقروب %s: %s", chat_id, error)
+
+
+# ============ الأوامر والأزرار ============
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعرض لوحة الأزرار."""
+    if not allowed(update):
         return
 
-    if not chat:
+    await update.message.reply_text(
+        "جاهز ✅\n"
+        "اختر السرعة لبدء الإرسال، أو اضغط ⛔ إيقاف.",
+        reply_markup=MENU,
+    )
+
+
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يتعامل مع أزرار لوحة التحكم."""
+    if not allowed(update):
+        return
+
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if not chat or not message:
         return
 
     chat_id = chat.id
-    if chat_id in chat_jobs:
-        cancel_chat_job(chat_id)
-        await update.message.reply_text("تم إيقاف الإرسال في هذا القروب.")
-    else:
-        await update.message.reply_text("ما في إرسال شغال حاليًا في هذا القروب.")
+    choice = message.text
 
-
-# ---------------- التعامل مع الأزرار ---------------- #
-
-async def speed_button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """معالجة ضغط زر السرعة من الـ Inline Keyboard."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    message = query.message
-
-    if not user or not is_allowed_user(user.id):
+    # إيقاف
+    if choice == "⛔ إيقاف":
+        if stop_sender(chat_id):
+            await message.reply_text("تم إيقاف الإرسال ⛔", reply_markup=MENU)
+        else:
+            await message.reply_text("ما فيه إرسال شغّال الآن.", reply_markup=MENU)
         return
 
-    if not message:
+    # حالة
+    if choice == "ℹ️ الحالة":
+        task = running_tasks.get(chat_id)
+        if task and not task.done():
+            await message.reply_text("الإرسال شغّال الآن ✅", reply_markup=MENU)
+        else:
+            await message.reply_text("الإرسال متوقف حاليًا ⛔", reply_markup=MENU)
         return
 
-    chat_id = message.chat_id
-    data = query.data  # مثل: "speed_fast"
+    # اختيار سرعة
+    if choice in SPEEDS:
+        seconds = SPEEDS[choice]
 
-    if data not in SPEEDS:
-        return
+        # يوقف أي إرسال سابق قبل تشغيل سرعة جديدة
+        stop_sender(chat_id)
 
-    # نحدّد السرعة بناء على الزر
-    interval_seconds = SPEEDS[data]
+        # ينشئ مهمة واحدة فقط للقروب
+        task = asyncio.create_task(send_loop(chat_id, context, seconds))
+        running_tasks[chat_id] = task
 
-    # نلغي أي Job قديم لهذا القروب
-    cancel_chat_job(chat_id)
-
-    # ننشئ Job جديد للإرسال المتكرر
-    job: Job = context.job_queue.run_repeating(
-        send_random_message_job,
-        interval=interval_seconds,
-        first=0.0,  # يبدأ فورًا
-        chat_id=chat_id,
-        name=f"spam_{chat_id}",
-        data={"interval": interval_seconds},
-    )
-    chat_jobs[chat_id] = job
-
-    # نحدّث رسالة الاختيار
-    text_speed = {
-        "speed_fast": "سريع (كل 2 ثانية تقريبًا)",
-        "speed_medium": "متوسط (كل 5 ثواني تقريبًا)",
-        "speed_slow": "بطيء (كل 10 ثواني تقريبًا)",
-    }.get(data, f"كل {interval_seconds} ثانية")
-
-    await query.edit_message_text(
-        f"تم تشغيل الإرسال العشوائي في هذا القروب.\n"
-        f"السرعة الحالية: {text_speed}\n"
-        f"لإيقاف الإرسال استخدم الأمر: /stop"
-    )
+        await message.reply_text(
+            f"تم التشغيل: {choice}\n"
+            f"رسالة كل {seconds} ثوانٍ.\n"
+            f"للإيقاف اضغط ⛔ إيقاف.",
+            reply_markup=MENU,
+        )
 
 
-# ---------------- Job الإرسال العشوائي ---------------- #
-
-async def send_random_message_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """دالة الـ Job التي ترسل رسالة عشوائية في كل تكرار."""
-    job = context.job
-    if not job:
-        return
-
-    chat_id = job.chat_id
-
-    # اختيار رسالة عشوائية
-    msg = random.choice(MESSAGES)
-
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=msg)
-    except Exception as e:
-        logger.error(f"Error sending message to chat {chat_id}: {e}")
-        # لو صار خطأ كثير ممكن نلغي الجوب لتجنب مشاكل
-        # cancel_chat_job(chat_id)
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """في حال أرسل أمرًا غير معروف، يعيد إظهار القائمة."""
+    if allowed(update):
+        await update.message.reply_text(
+            "استخدم الأزرار الموجودة أسفل المحادثة.",
+            reply_markup=MENU,
+        )
 
 
-# ---------------- نقطة الدخول الرئيسية ---------------- #
+# ============ تشغيل البوت ============
 
-def main() -> None:
-    """تجهيز وتشغيل البوت باستخدام Long Polling."""
-    application = Application.builder().token(BOT_TOKEN).build()
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is not set")
 
-    # أوامر
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("speed", speed_command))
-    application.add_handler(CommandHandler("stop", stop_command))
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # أزرار السرعة
-    application.add_handler(CallbackQueryHandler(speed_button_handler))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    # تشغيل البوت
-    logger.info("Starting bot...")
-    application.run_polling()
+    print("Bot is running...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
